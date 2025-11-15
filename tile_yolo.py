@@ -7,7 +7,7 @@ import argparse
 import os
 import random
 from shutil import copyfile
- 
+from pathlib import Path
 
 def tiler(imnames, newpath, falsepath, slice_size, ext):
     for imname in imnames:
@@ -15,8 +15,8 @@ def tiler(imnames, newpath, falsepath, slice_size, ext):
         imr = np.array(im, dtype=np.uint8)
         height = imr.shape[0]
         width = imr.shape[1]
-        labname = imname.replace(ext, '.txt')
-        labels = pd.read_csv(labname, sep=' ', names=['class', 'x1', 'y1', 'w', 'h'])
+        labname = os.path.join("\\".join(imname.split("\\")[0:-1]),Path(imname).stem+'.txt')
+        labels = pd.read_csv(labname, sep=' ', names=['class', 'x1', 'y1', 'w', 'h'], encoding='utf-8')
         
         # we need to rescale coordinates from 0-1 to real image height and width
         labels[['x1', 'w']] = labels[['x1', 'w']] * width
@@ -34,7 +34,7 @@ def tiler(imnames, newpath, falsepath, slice_size, ext):
             boxes.append((int(row[1]['class']), Polygon([(x1, y1), (x2, y1), (x2, y2), (x1, y2)])))
         
         counter = 0
-        print('Image:', imname)
+        
         # create tiles and find intersection with bounding boxes for each tile
         for i in range((height // slice_size)):
             for j in range((width // slice_size)):
@@ -54,9 +54,9 @@ def tiler(imnames, newpath, falsepath, slice_size, ext):
                         if not imsaved:
                             sliced = imr[i*slice_size:(i+1)*slice_size, j*slice_size:(j+1)*slice_size]
                             sliced_im = Image.fromarray(sliced)
-                            filename = imname.split('/')[-1]
-                            slice_path = newpath + "/" + filename.replace(ext, f'_{i}_{j}{ext}')                            
-                            slice_labels_path = newpath + "/" + filename.replace(ext, f'_{i}_{j}.txt')                            
+                            filename = Path(imname).stem
+                            slice_path = newpath + "/" + filename + f'_{i}_{j}{ext}'                            
+                            slice_labels_path = newpath + "/" + filename + f'_{i}_{j}.txt'                       
                             print(slice_path)
                             sliced_im.save(slice_path)
                             imsaved = True                    
@@ -90,8 +90,8 @@ def tiler(imnames, newpath, falsepath, slice_size, ext):
                 if not imsaved and falsepath:
                     sliced = imr[i*slice_size:(i+1)*slice_size, j*slice_size:(j+1)*slice_size]
                     sliced_im = Image.fromarray(sliced)
-                    filename = imname.split('/')[-1]
-                    slice_path = falsepath + "/" + filename.replace(ext, f'_{i}_{j}{ext}')                
+                    filename = Path(imname).stem
+                    slice_path = falsepath + "/" + filename + f'_{i}_{j}{ext}'                
 
                     sliced_im.save(slice_path)
                     print('Slice without boxes saved')
