@@ -6,7 +6,7 @@ This script can cut images and corresponding labels from YOLO dataset into tiles
 
 ## Usage 
 
-`python3 tyle_yolo.py -source ./yolosample/ts/ -target ./yolosliced/ts/ -ext .JPG -size 512`
+`python3 tile_yolo.py -source ./yolosample/ts/ -target ./yolosliced/ts/ -ext .jpg -size 512`
 
 ## Arguments
 
