@@ -2,12 +2,10 @@ import os
 from PIL import Image
 import matplotlib.pyplot as plt
 import matplotlib.patches as patches
+from pathlib import Path
 
 # ==== CONFIG – CHANGE THESE ====
-main_path = r""
-filename = ""
-IMAGE_PATH = os.path.join(main_path,filename + ".jpg")
-LABEL_PATH = os.path.join(main_path,filename + ".txt")
+main_path = r"C:\Users\Wojtek\Documents\GitHub\Tools\magisterka\temp_augment_data_dir_LARGER_augment_resized"
 # ===============================
 
 def load_yolo_annotations(label_path, img_width, img_height):
@@ -49,7 +47,7 @@ def load_yolo_annotations(label_path, img_width, img_height):
 
     return boxes
 
-def visualize_image_with_boxes(image_path, label_path):
+def visualize_image_with_boxes(main_path,image_path, label_path):
     # Load image
     img = Image.open(image_path).convert("RGB")
     img_width, img_height = img.size
@@ -58,10 +56,10 @@ def visualize_image_with_boxes(image_path, label_path):
     boxes = load_yolo_annotations(label_path, img_width, img_height)
 
     # Plot
-    fig, ax = plt.subplots()
+    fig, ax = plt.subplots(1,1, figsize=(12,8))
     ax.imshow(img)
     ax.set_title(os.path.basename(image_path))
-    ax.axis("off")
+    # ax.axis("off")
 
     # Add boxes
     for cls, x_min, y_min, box_w, box_h in boxes:
@@ -75,7 +73,7 @@ def visualize_image_with_boxes(image_path, label_path):
             facecolor='none'
         )
         ax.add_patch(rect)
-
+        print("BBOX: ", x_min, y_min, box_w, box_h)
         # Optional: draw class id text
         ax.text(
             x_min,
@@ -86,7 +84,21 @@ def visualize_image_with_boxes(image_path, label_path):
             bbox=dict(facecolor='black', alpha=0.5, edgecolor='none')
         )
 
-    plt.show()
+    # Save the plot instead of showing (more reliable)
+    out_path = r"C:\Users\Wojtek\Documents\GitHub\Tools\magisterka\temp_augment_data_dir_LARGER_augment_resized\visualizations"
+    plt.savefig(os.path.join(out_path,Path(IMAGE_PATH).stem+"_vis.jpg"), bbox_inches='tight', dpi=150)
+    plt.close(fig)  # Close to free memory
+    print(f"Visualization saved to {Path(IMAGE_PATH).stem}_vis.jpg")
 
 if __name__ == "__main__":
-    visualize_image_with_boxes(IMAGE_PATH, LABEL_PATH)
+    count = 0
+    for filename in os.listdir(os.path.join(main_path,'images')):
+        # if filename.endswith(".jpg"):
+        filename = Path(filename).stem
+        IMAGE_PATH = os.path.join(main_path,"images",filename+ ".jpg")
+        LABEL_PATH = os.path.join(main_path,"labels",filename + ".txt")
+        visualize_image_with_boxes(main_path,IMAGE_PATH, LABEL_PATH)
+        count += 1
+        if count == 200:
+            break
+        
