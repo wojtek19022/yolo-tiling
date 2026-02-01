@@ -5,107 +5,143 @@ import argparse
 import re
 from pathlib import Path
 from typing import Optional, Tuple, Dict
+import xml.etree.ElementTree as ET
 
-from affine import Affine
 from PIL import Image
-import rasterio
 
 
-# ---------- worldfile helpers ----------
-
-def worldfile_ext(img: Path) -> str:
-    ext = img.suffix.lower()
-    return {
-        ".jpg": ".jgw",
-        ".jpeg": ".jgw",
-        ".png": ".pgw",
-        ".tif": ".tfw",
-        ".tiff": ".tfw",
-    }.get(ext, ".wld")
+LEADING_WEIRD = re.compile(r"^[0-9a-fA-F]{8}-")            # 00bb88ea-
+LAST_TWO = re.compile(r"_(?P<a>\d+)_(?P<b>\d+)$")          # ending _2_1
+# base + frame: "...<base>.jpg_<frame>_..."
+REF_FROM_TILE = re.compile(r"(?P<base>.+?)\.(jpg|jpeg)_(?P<frame>\d+)_", re.IGNORECASE)
 
 
-def write_worldfile(path: Path, t: Affine) -> None:
-    # ESRI world file 6-line format: A, D, B, E, C, F
-    path.write_text(
-        f"{t.a:.12f}\n{t.d:.12f}\n{t.b:.12f}\n{t.e:.12f}\n{t.c:.12f}\n{t.f:.12f}\n",
-        encoding="utf-8",
-    )
+def normalize_stem(stem: str) -> str:
+    return LEADING_WEIRD.sub("", stem)
 
 
-# ---------- name normalization (your "weird beginning") ----------
-
-LEADING_WEIRD_PREFIX = re.compile(r"^[0-9a-fA-F]{8}-")  # e.g. ffbdc372-
-
-
-def normalize_tile_name(tile_name: str) -> str:
-    """
-    Remove leading 'ffbdc372-' style prefix if present.
-    Example:
-      ffbdc372-20210911_... -> 20210911_...
-    """
-    return LEADING_WEIRD_PREFIX.sub("", tile_name)
-
-
-def extract_reference_filename_from_tile(normalized_tile_name: str) -> Optional[str]:
-    """
-    Tiles contain the reference JPG name inside them, e.g.:
-      20210911_..._Nadir.jpg_119_sharp_augment_2_0_12_34.jpg
-
-    This function returns:
-      20210911_..._Nadir.jpg
-    (everything up to first .jpg/.jpeg)
-    """
-    m = re.search(r"\.(jpg|jpeg)", normalized_tile_name, re.IGNORECASE)
+def parse_last_two(stem: str) -> Optional[Tuple[int, int]]:
+    m = LAST_TWO.search(stem)
     if not m:
         return None
-    end = m.end()  # include extension
-    return normalized_tile_name[:end]
+    return int(m.group("a")), int(m.group("b"))
 
 
-# ---------- tile parsing ----------
-
-def parse_row_col(tile_name: str, rc_pattern: re.Pattern) -> Optional[Tuple[int, int]]:
-    """
-    Default expects trailing _<row>_<col>.<ext>
-    """
-    m = rc_pattern.search(tile_name)
-    if not m:
+def extract_ref_base_and_frame(normalized_stem: str) -> Optional[Tuple[str, Optional[str]]]:
+    m = REF_FROM_TILE.search(normalized_stem)
+    if m:
+        return m.group("base"), m.group("frame")
+    # fallback: just "...<base>.jpg..."
+    m2 = re.search(r"(?P<base>.+?)\.(jpg|jpeg)", normalized_stem, re.IGNORECASE)
+    if not m2:
         return None
-    return int(m.group("row")), int(m.group("col"))
+    return m2.group("base"), None
 
 
-# ---------- reference georef (from .aux/.aux.xml via GDAL) ----------
+def build_ref_index(refs_dir: Path, recursive: bool) -> Dict[str, Path]:
+    it = refs_dir.rglob("*.jp*g") if recursive else refs_dir.glob("*.jp*g")
+    return {p.name.lower(): p for p in it if p.is_file()}
 
-def read_reference_georef(ref_jpg: Path) -> Tuple[Affine, str]:
+
+def choose_reference(ref_index: Dict[str, Path], base: str, frame: Optional[str]) -> Optional[Path]:
     """
-    Reads transform + CRS from reference image.
-    rasterio/GDAL will use .aux/.aux.xml if present.
+    Try common on-disk names:
+      base.jpg
+      base_<frame>.jpg
+      base-<frame>.jpg
     """
-    with rasterio.open(ref_jpg) as src:
-        if src.crs is None:
-            raise RuntimeError(f"Reference has no CRS (even after reading .aux/.aux.xml): {ref_jpg}")
-        return src.transform, src.crs.to_wkt()
+    candidates = [f"{base}.jpg", f"{base}.jpeg"]
+    if frame:
+        candidates += [
+            f"{base}_{frame}.jpg", f"{base}_{frame}.jpeg",
+            f"{base}-{frame}.jpg", f"{base}-{frame}.jpeg",
+        ]
+    for c in candidates:
+        p = ref_index.get(c.lower())
+        if p:
+            return p
+
+    # fuzzy fallback
+    base_l = base.lower()
+    frame_l = frame.lower() if frame else None
+    best = None
+    best_len = 10**9
+    for name_l, p in ref_index.items():
+        if not name_l.startswith(base_l):
+            continue
+        if frame_l and frame_l not in name_l:
+            continue
+        if len(name_l) < best_len:
+            best = p
+            best_len = len(name_l)
+    return best
 
 
-# ---------- main ----------
+def parse_geotransform_text(gt_text: str) -> Tuple[float, float, float, float, float, float]:
+    # input like: "  6.38e+05, -2.26e-02, ..."
+    parts = [p.strip() for p in gt_text.replace("\n", " ").split(",")]
+    if len(parts) != 6:
+        raise ValueError(f"GeoTransform does not have 6 values: {gt_text!r}")
+    return tuple(float(x) for x in parts)  # type: ignore
+
+
+def format_geotransform(gt: Tuple[float, float, float, float, float, float]) -> str:
+    # Match GDAL-ish style: leading spaces + comma-separated
+    return "  " + ", ".join(f"{v:.16e}" for v in gt)
+
+
+def shifted_geotransform(gt: Tuple[float, float, float, float, float, float],
+                         col_off_px: int,
+                         row_off_px: int) -> Tuple[float, float, float, float, float, float]:
+    """
+    GDAL geotransform:
+      Xgeo = GT0 + col*GT1 + row*GT2
+      Ygeo = GT3 + col*GT4 + row*GT5
+    """
+    GT0, GT1, GT2, GT3, GT4, GT5 = gt
+    new_GT0 = GT0 + col_off_px * GT1 + row_off_px * GT2
+    new_GT3 = GT3 + col_off_px * GT4 + row_off_px * GT5
+    return (new_GT0, GT1, GT2, new_GT3, GT4, GT5)
+
+
+def ensure_metadata_blocks(root: ET.Element) -> None:
+    """
+    Your template already has them. This is a no-op placeholder in case
+    some references miss the blocks (we don't invent values).
+    """
+    return
+
+
+def update_geotransform_in_auxxml(aux_tree: ET.ElementTree, new_gt: Tuple[float, float, float, float, float, float]) -> None:
+    root = aux_tree.getroot()
+    gt_el = root.find("GeoTransform")
+    if gt_el is None:
+        # Create it near the top after SRS, to mimic GDAL structure.
+        srs_el = root.find("SRS")
+        gt_el = ET.Element("GeoTransform")
+        if srs_el is not None:
+            # insert after SRS
+            idx = list(root).index(srs_el) + 1
+            root.insert(idx, gt_el)
+        else:
+            root.insert(0, gt_el)
+
+    gt_el.text = format_geotransform(new_gt)
+
 
 def main() -> int:
     ap = argparse.ArgumentParser(
-        description="Create per-tile .jgw + .prj using georef stored in reference JPG .aux/.aux.xml files."
+        description="Generate tile.jpg.aux.xml by copying reference .aux.xml structure and updating only GeoTransform per tile."
     )
-    ap.add_argument("--refs", required=True, help="Folder containing reference JPGs (with .aux/.aux.xml).")
-    ap.add_argument("--tiles", required=True, help="Folder containing tile images.")
-    ap.add_argument("--tile-size", type=int, default=512, help="Tile size in px (default 512).")
-    ap.add_argument("--stride", type=int, default=None,
-                    help="Stride in px (default = tile-size). If overlap, stride = tile_size - overlap.")
-    ap.add_argument("--recursive-refs", action="store_true", help="Scan refs recursively.")
-    ap.add_argument("--recursive-tiles", action="store_true", help="Scan tiles recursively.")
-    ap.add_argument("--ref-glob", default="*.jpg", help="Glob for reference JPGs (default *.jpg).")
-    ap.add_argument(
-        "--tile-regex",
-        default=r"_(?P<row>\d+)_(?P<col>\d+)\.(jpg|jpeg|png)$",
-        help="Regex to parse tile row/col at end. Must include named groups row and col.",
-    )
+    ap.add_argument("--refs", required=True, help="Folder with reference JPG + reference.jpg.aux.xml")
+    ap.add_argument("--tiles", required=True, help="Folder with tile JPGs")
+    ap.add_argument("--tile-size", type=int, default=512)
+    ap.add_argument("--stride", type=int, default=None)
+    ap.add_argument("--recursive-refs", action="store_true")
+    ap.add_argument("--recursive-tiles", action="store_true")
+    ap.add_argument("--swap-rowcol", action="store_true", help="Interpret last _A_B as col_row instead of row_col")
+    ap.add_argument("--tiles-glob", default="*.jp*g")
+    ap.add_argument("--debug", action="store_true")
     args = ap.parse_args()
 
     refs_dir = Path(args.refs)
@@ -116,100 +152,111 @@ def main() -> int:
         raise SystemExit(f"Tiles folder not found: {tiles_dir}")
 
     stride = args.stride if args.stride is not None else args.tile_size
-    rc_pattern = re.compile(args.tile_regex, re.IGNORECASE)
 
-    # Index reference JPGs by filename (WITH extension) and by stem (fallback)
-    ref_iter = refs_dir.rglob(args.ref_glob) if args.recursive_refs else refs_dir.glob(args.ref_glob)
-    refs_by_name: Dict[str, Path] = {}
-    refs_by_stem: Dict[str, Path] = {}
+    ref_index = build_ref_index(refs_dir, args.recursive_refs)
+    if not ref_index:
+        raise SystemExit("No reference JPGs found.")
 
-    for p in ref_iter:
-        if p.is_file():
-            refs_by_name[p.name] = p
-            refs_by_stem[p.stem] = p
+    # cache parsed reference aux.xml and GT
+    ref_cache: Dict[Path, Tuple[ET.ElementTree, Tuple[float, float, float, float, float, float]]] = {}
 
-    if not refs_by_name:
-        raise SystemExit(f"No reference JPGs found in {refs_dir} using glob {args.ref_glob!r}")
-
-    # Cache georef to avoid reopening reference files repeatedly
-    georef_cache: Dict[Path, Tuple[Affine, str]] = {}
-
-    tile_iter = tiles_dir.rglob("*") if args.recursive_tiles else tiles_dir.glob("*")
+    tile_iter = tiles_dir.rglob(args.tiles_glob) if args.recursive_tiles else tiles_dir.glob(args.tiles_glob)
 
     processed = 0
     skipped = 0
     no_ref = 0
-    ref_errors = 0
+    bad_ref = 0
 
-    for tile in tile_iter:
-        if not tile.is_file():
+    from tqdm import tqdm
+    import os
+
+    for tile_path in tqdm(tile_iter, total=len([file for file in os.listdir(tiles_dir) if file.endswith(".jpg")])):
+        if not tile_path.is_file():
             continue
 
-        # Parse row/col from actual file name (not normalized) or normalized — either is fine for tail pattern.
-        rc = parse_row_col(tile.name, rc_pattern)
-        if rc is None:
+        # only handle actual tiles that end with _A_B
+        last = parse_last_two(tile_path.stem)
+        if last is None:
             skipped += 1
             continue
-        row, col = rc
+        a, b = last
+        if args.swap_rowcol:
+            tile_col, tile_row = a, b
+        else:
+            tile_row, tile_col = a, b
 
-        # Normalize: remove leading ffbdc372-
-        norm_name = normalize_tile_name(tile.name)
-
-        # Extract reference image filename embedded in tile name
-        ref_filename = extract_reference_filename_from_tile(norm_name)
-        if ref_filename is None:
+        normalized = normalize_stem(tile_path.stem)
+        base_frame = extract_ref_base_and_frame(normalized)
+        if base_frame is None:
             skipped += 1
             continue
+        base, frame = base_frame
 
-        # Find matching reference path
-        ref_path = refs_by_name.get(ref_filename)
-        if ref_path is None:
-            # Fallback: try stem match if tile used ".jpg" inside but reference might be different case, etc.
-            ref_stem = Path(ref_filename).stem
-            ref_path = refs_by_stem.get(ref_stem)
-
-        if ref_path is None:
+        ref_jpg = choose_reference(ref_index, base, frame)
+        if ref_jpg is None:
             no_ref += 1
+            if args.debug:
+                print(f"[NO REF] {tile_path.name} base={base!r} frame={frame!r}")
             continue
 
-        # Load reference georef (from aux) once
-        if ref_path not in georef_cache:
+        ref_aux = Path(str(ref_jpg) + ".aux.xml")  # reference.jpg.aux.xml
+        if not ref_aux.exists():
+            bad_ref += 1
+            if args.debug:
+                print(f"[BAD REF] Missing aux: {ref_aux}")
+            continue
+
+        # cache reference tree + base GT
+        if ref_jpg not in ref_cache:
             try:
-                georef_cache[ref_path] = read_reference_georef(ref_path)
+                aux_tree = ET.parse(ref_aux)
+                root = aux_tree.getroot()
+                if root.tag != "PAMDataset":
+                    raise RuntimeError(f"Unexpected root tag: {root.tag}")
+                gt_el = root.find("GeoTransform")
+                if gt_el is None or not (gt_el.text and gt_el.text.strip()):
+                    raise RuntimeError("Reference aux.xml missing GeoTransform text")
+                ref_gt = parse_geotransform_text(gt_el.text)
+                ensure_metadata_blocks(root)
+                ref_cache[ref_jpg] = (aux_tree, ref_gt)
             except Exception as e:
-                ref_errors += 1
-                print(f"[REF ERROR] {ref_path} -> {e}")
+                bad_ref += 1
+                print(f"[BAD REF] {ref_aux.name}: {e}")
                 continue
 
-        base_transform, crs_wkt = georef_cache[ref_path]
-
-        # Make sure tile is readable (edge tiles can be smaller)
+        # read tile size (not strictly needed unless you later handle flips)
         try:
-            with Image.open(tile) as im:
+            with Image.open(tile_path) as im:
                 _w, _h = im.size
         except Exception:
             skipped += 1
             continue
 
-        # Compute pixel offset of tile in reference image
-        row_off = row * stride
-        col_off = col * stride
+        aux_tree_template, ref_gt = ref_cache[ref_jpg]
 
-        # Shift reference transform by pixel offset (works also for rotated transforms)
-        tile_transform = base_transform * Affine.translation(col_off, row_off)
+        # Compute tile GT using tile indices -> pixel offsets
+        row_off = tile_row * stride
+        col_off = tile_col * stride
+        tile_gt = shifted_geotransform(ref_gt, col_off_px=col_off, row_off_px=row_off)
 
-        # Write sidecars PER TILE
-        write_worldfile(tile.with_suffix(worldfile_ext(tile)), tile_transform)
-        tile.with_suffix(".prj").write_text(crs_wkt, encoding="utf-8")
+        # IMPORTANT: clone the tree so we don't mutate the cached template
+        aux_tree = ET.ElementTree(ET.fromstring(ET.tostring(aux_tree_template.getroot(), encoding="utf-8")))
+
+        update_geotransform_in_auxxml(aux_tree, tile_gt)
+
+        out_aux = Path(str(tile_path) + ".aux.xml")
+        aux_tree.write(out_aux, encoding="UTF-8", xml_declaration=False)
 
         processed += 1
+        if args.debug and processed <= 5:
+            print(f"[OK] {tile_path.name} -> {out_aux.name} using ref={ref_jpg.name} row={tile_row} col={tile_col}")
 
     print("Done.")
-    print(f"Processed tiles (wrote .jgw + .prj for each): {processed}")
-    print(f"Skipped (name mismatch / unreadable): {skipped}")
-    print(f"No matching reference found: {no_ref}")
-    print(f"Reference read errors: {ref_errors}")
-    print(f"Stride used: {stride}px (tile-size arg: {args.tile_size}px)")
+    print(f"Processed tiles (wrote aux.xml): {processed}")
+    print(f"No matching reference: {no_ref}")
+    print(f"Skipped (non-tiles or parse/read issues): {skipped}")
+    print(f"Bad references (missing/broken aux.xml): {bad_ref}")
+    print(f"Stride used: {stride}px (tile-size={args.tile_size}px) swap-rowcol={args.swap_rowcol}")
     return 0
 
 
